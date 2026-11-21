@@ -137,6 +137,83 @@ function csvDownload(name, rows, cols) {
   a.href = URL.createObjectURL(new Blob(['﻿' + out], { type:'text/csv;charset=utf-8' }));
   a.download = name + '.csv'; a.click();
 }
+// ---------- export ----------
+const KAS_COLS = [['no','No'], ['tanggal','Tanggal'], [p => p.akun_kas + ' ' + acctName(p.akun_kas), 'Akun kas'],
+  [p => p.akun_lawan ? p.akun_lawan + ' ' + acctName(p.akun_lawan) : '', 'Akun lawan'], ['keterangan','Keterangan'],
+  [p => p.arah === 'masuk' ? Number(p.jumlah) : '', 'Masuk'], [p => p.arah === 'keluar' ? Number(p.jumlah) : '', 'Keluar'],
+  [p => p.dibatalkan ? 'BATAL' : '', 'Status']];
+const flatJournals = js => js.flatMap(j => j.journal_lines.map(l => ({ tanggal: j.tanggal, no: j.no, keterangan: j.keterangan, sumber: j.sumber,
+  status: j.dibatalkan ? 'BATAL' : '', akun: l.akun, nama: acctName(l.akun), debit: Number(l.debit), kredit: Number(l.kredit), memo: l.memo || '' })));
+const JURNAL_COLS = [['tanggal','Tanggal'],['no','No'],['keterangan','Keterangan'],['sumber','Sumber'],['akun','Kode akun'],['nama','Nama akun'],['debit','Debit'],['kredit','Kredit'],['memo','Memo'],['status','Status']];
+function lrRows(tb) {
+  const P = tb.filter(r => r.tipe === 'PENDAPATAN').map(r => ({ ...r, v: r.kredit - r.debit })).filter(r => r.v);
+  const B = tb.filter(r => r.tipe === 'BEBAN').map(r => ({ ...r, v: r.debit - r.kredit })).filter(r => r.v);
+  const tp = sum(P, 'v'), tbb = sum(B, 'v');
+  return { P, B, tp, tbb, laba: tp - tbb };
+}
+function nrRows(tb) {
+  const g = t => tb.filter(r => r.tipe === t && Number(r.saldo_akhir));
+  const laba = sum(tb.filter(r => r.tipe === 'PENDAPATAN'), 'saldo_akhir') - sum(tb.filter(r => r.tipe === 'BEBAN'), 'saldo_akhir');
+  const A = g('ASET').map(r => ({ ...r, v: r.normal === 'D' ? +r.saldo_akhir : -r.saldo_akhir }));
+  const K = g('KEWAJIBAN').map(r => ({ ...r, v: +r.saldo_akhir })), E = g('EKUITAS').map(r => ({ ...r, v: +r.saldo_akhir }));
+  const ta = sum(A, 'v'), tk = sum(K, 'v'), te = sum(E, 'v') + laba;
+  return { A, K, E, laba, ta, tk, te };
+}
+let xlsxLoading;
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve();
+  return xlsxLoading = xlsxLoading || new Promise((ok, no) => {
+    const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    s.onload = ok; s.onerror = () => no(new Error('Gagal memuat library Excel')); document.head.appendChild(s);
+  });
+}
+function monthsBetween(d1, d2) {
+  const out = []; let [y, m] = d1.slice(0, 7).split('-').map(Number); const [y2, m2] = d2.slice(0, 7).split('-').map(Number);
+  while (y < y2 || (y === y2 && m <= m2)) { out.push(`${y}-${pad(m)}`); m++; if (m > 12) { m = 1; y++; } }
+  return out;
+}
+async function exportKonsultan(d1, d2) {
+  toast('Menyiapkan file Excel…');
+  await loadXLSX();
+  const all = async mk => { let out = [], i = 0; for (;;) { const part = await q(mk().range(i, i + 999)); out = out.concat(part); if (part.length < 1000) return out; i += 1000; } };
+  const [tb, pays, js] = await Promise.all([
+    q(sb.rpc('neraca_saldo', { p_dari: d1, p_sampai: d2 })),
+    all(() => sb.from('payments').select('*').gte('tanggal', d1).lte('tanggal', d2).order('tanggal').order('created_at').order('id')),
+    all(() => sb.from('journals').select('*, journal_lines(akun,debit,kredit,memo)').gte('tanggal', d1).lte('tanggal', d2).order('tanggal').order('created_at').order('id'))
+  ]);
+  const months = monthsBetween(d1, d2);
+  const per = await Promise.all(months.map(ym => { const [a, b] = monthRange(ym); return q(sb.rpc('neraca_saldo', { p_dari: a < d1 ? d1 : a, p_sampai: b > d2 ? d2 : b })); }));
+  const wb = XLSX.utils.book_new();
+  const add = (name, aoa, widths) => { const ws = XLSX.utils.aoa_to_sheet(aoa); if (widths) ws['!cols'] = widths.map(w => ({ wch: w })); XLSX.utils.book_append_sheet(wb, ws, name); };
+  const lr = lrRows(tb), nr = nrRows(tb), s = S.settings;
+  add('Ringkasan', [[s.nama_perusahaan], ['NPWP', s.npwp || '-'], ['Periode', `${d1} s/d ${d2}`], ['Dibuat', new Date().toLocaleString('id-ID')], [],
+    ['Total pendapatan', lr.tp], ['Total beban', lr.tbb], [lr.laba >= 0 ? 'Laba bersih (sebelum PPh Badan)' : 'Rugi bersih', lr.laba], [],
+    ['Total aset', nr.ta], ['Total kewajiban', nr.tk], ['Total ekuitas (termasuk laba berjalan)', nr.te], [],
+    ['Catatan: data dari buku kas; PPN/PPh atas invoice & vendor belum dipisah kecuali diinput lewat menu Penjualan/Pembelian.']], [42, 22]);
+  add('Laba Rugi', [['Kelompok', 'Kode', 'Akun', 'Jumlah'], ...lr.P.map(r => ['Pendapatan', r.kode, r.nama, r.v]), ['', '', 'Total pendapatan', lr.tp],
+    ...lr.B.map(r => ['Beban', r.kode, r.nama, r.v]), ['', '', 'Total beban', lr.tbb], ['', '', lr.laba >= 0 ? 'LABA BERSIH' : 'RUGI BERSIH', lr.laba]], [12, 9, 44, 18]);
+  const lrAcc = tb.filter(r => r.tipe === 'PENDAPATAN' || r.tipe === 'BEBAN');
+  const mv = (t, k, i) => { const r = per[i].find(x => x.kode === k); return r ? (t === 'PENDAPATAN' ? r.kredit - r.debit : r.debit - r.kredit) : 0; };
+  const rowsM = lrAcc.map(a => [a.tipe, a.kode, a.nama, ...months.map((_, i) => mv(a.tipe, a.kode, i))]).filter(r => r.slice(3).some(v => v));
+  const totM = t => months.map((_, i) => sum(lrAcc.filter(a => a.tipe === t), a => mv(t, a.kode, i)));
+  const tP = totM('PENDAPATAN'), tB = totM('BEBAN');
+  add('Laba Rugi per Bulan', [['Kelompok', 'Kode', 'Akun', ...months.map(monthName)], ...rowsM,
+    ['', '', 'Total pendapatan', ...tP], ['', '', 'Total beban', ...tB], ['', '', 'Laba (rugi)', ...tP.map((v, i) => v - tB[i])]], [12, 9, 44, ...months.map(() => 18)]);
+  add('Neraca', [['Kelompok', 'Kode', 'Akun', `Saldo per ${d2}`], ...nr.A.map(r => ['Aset', r.kode, r.nama, r.v]), ['', '', 'Total aset', nr.ta],
+    ...nr.K.map(r => ['Kewajiban', r.kode, r.nama, r.v]), ['', '', 'Total kewajiban', nr.tk],
+    ...nr.E.map(r => ['Ekuitas', r.kode, r.nama, r.v]), ['Ekuitas', '', 'Laba (rugi) belum ditutup', nr.laba], ['', '', 'Total ekuitas', nr.te],
+    ['', '', 'Total kewajiban + ekuitas', nr.tk + nr.te]], [12, 9, 44, 18]);
+  const ns = tb.filter(r => Number(r.saldo_awal) || Number(r.debit) || Number(r.kredit) || Number(r.saldo_akhir));
+  add('Neraca Saldo', [['Kode', 'Akun', 'Tipe', 'Saldo awal', 'Debit', 'Kredit', 'Saldo akhir'], ...ns.map(r => [r.kode, r.nama, r.tipe, +r.saldo_awal, +r.debit, +r.kredit, +r.saldo_akhir])], [9, 44, 12, 18, 18, 18, 18]);
+  add('Transaksi Kas', [KAS_COLS.map(c => c[1]), ...pays.map(p => KAS_COLS.map(c => typeof c[0] === 'function' ? c[0](p) : p[c[0]]))], [16, 12, 24, 40, 44, 16, 16, 8]);
+  const cek = pays.filter(p => ['1-1900', '6-1900', '2-1900', '1-1100', '1-1700'].includes(p.akun_lawan) && !p.dibatalkan);
+  add('Perlu Dicek', [['Tanggal', 'No', 'Keterangan', 'Dicatat di akun', 'Masuk', 'Keluar', 'Penjelasan'],
+    ...cek.map(p => [p.tanggal, p.no, p.keterangan, p.akun_lawan + ' ' + acctName(p.akun_lawan), p.arah === 'masuk' ? +p.jumlah : '', p.arah === 'keluar' ? +p.jumlah : '', ''])], [12, 16, 44, 40, 16, 16, 40]);
+  const fj = flatJournals(js);
+  add('Jurnal', [JURNAL_COLS.map(c => c[1]), ...fj.map(r => JURNAL_COLS.map(c => r[c[0]]))], [12, 16, 40, 12, 10, 36, 16, 16, 20, 8]);
+  XLSX.writeFile(wb, `ABL_laporan_${d1}_sd_${d2}.xlsx`);
+}
+
 function acctOptions(filter, sel) {
   return S.accounts.filter(a => a.aktif && (!filter || filter(a)))
     .map(a => `<option value="${a.kode}" ${a.kode === sel ? 'selected' : ''}>${a.kode} · ${esc(a.nama)}</option>`).join('');
@@ -554,12 +631,15 @@ function contactForm(ct, defTipe, after) {
 // ================== KAS & BANK ==================
 async function pgKas(el) {
   el.innerHTML = `<h2>Kas & Bank</h2>
-  <div class="bar">${monthPicker('k-m')}<span class="sp"></span>
+  <div class="bar">${monthPicker('k-m')}<button class="btn" id="k-csv">Export CSV</button><span class="sp"></span>
     ${canWrite() ? '<button class="btn p" id="k-in">＋ Kas masuk</button><button class="btn p" id="k-out">＋ Kas keluar</button>' : ''}</div>
   <div class="grid kpis" id="k-saldo"></div><div class="card tw" id="k-list"></div>`;
+  let rows = [];
+  $('#k-csv').onclick = () => csvDownload('kas_bank_' + $('#k-m').value, [...rows].reverse(), KAS_COLS);
   const load = async () => {
     const [d1, d2] = monthRange($('#k-m').value);
-    const [rows, tb] = await Promise.all([
+    let tb;
+    [rows, tb] = await Promise.all([
       q(sb.from('payments').select('*').gte('tanggal', d1).lte('tanggal', d2).order('tanggal', { ascending:false }).order('created_at', { ascending:false })),
       q(sb.rpc('neraca_saldo', { p_dari: d1, p_sampai: d2 }))
     ]);
@@ -752,7 +832,9 @@ async function pgPajak(el) {
 async function pgLaporan(el) {
   const y = today().slice(0, 4);
   el.innerHTML = `<h2>Laporan Keuangan</h2>
-  <div class="bar"><input type="date" id="l-d1" value="${y}-01-01" style="width:auto"> s/d <input type="date" id="l-d2" value="${today()}" style="width:auto"></div>
+  <div class="bar"><input type="date" id="l-d1" value="${y}-01-01" style="width:auto"> s/d <input type="date" id="l-d2" value="${today()}" style="width:auto">
+    <span class="sp"></span><button class="btn p" id="l-xlsx">⬇ Excel untuk konsultan</button></div>
+  <p class="note">File Excel berisi: ringkasan, laba rugi, laba rugi per bulan, neraca, neraca saldo, semua transaksi kas, daftar transaksi yang perlu dicek, dan jurnal.</p>
   <div class="seg"><button data-t="lr" class="on">Laba Rugi</button><button data-t="nr">Neraca</button><button data-t="ns">Neraca Saldo</button><button data-t="bb">Buku Besar</button></div>
   <div class="card" id="l-body"></div>`;
   let tab = 'lr';
@@ -805,15 +887,22 @@ async function pgLaporan(el) {
   };
   $$('.seg button', el).forEach(bt => bt.onclick = () => { tab = bt.dataset.t; $$('.seg button', el).forEach(x => x.classList.toggle('on', x === bt)); render(); });
   $('#l-d1').onchange = render; $('#l-d2').onchange = render;
+  $('#l-xlsx').onclick = async () => {
+    const bt = $('#l-xlsx'); bt.disabled = true;
+    try { await exportKonsultan($('#l-d1').value, $('#l-d2').value); } catch (e) { toast(e.message, true); }
+    bt.disabled = false;
+  };
   await render();
 }
 
 // ================== JURNAL ==================
 async function pgJurnal(el) {
-  el.innerHTML = `<h2>Jurnal</h2><div class="bar">${monthPicker('j-m')}<span class="sp"></span>${canWrite() ? '<button class="btn p" id="j-new">＋ Jurnal manual</button>' : ''}</div><div class="card tw" id="j-list"></div>`;
+  el.innerHTML = `<h2>Jurnal</h2><div class="bar">${monthPicker('j-m')}<button class="btn" id="j-csv">Export CSV</button><span class="sp"></span>${canWrite() ? '<button class="btn p" id="j-new">＋ Jurnal manual</button>' : ''}</div><div class="card tw" id="j-list"></div>`;
+  let rows = [];
+  $('#j-csv').onclick = () => csvDownload('jurnal_' + $('#j-m').value, flatJournals([...rows].reverse()), JURNAL_COLS);
   const load = async () => {
     const [d1, d2] = monthRange($('#j-m').value);
-    const rows = await q(sb.from('journals').select('*, journal_lines(akun,debit,kredit,memo)').gte('tanggal', d1).lte('tanggal', d2).order('tanggal', { ascending:false }).order('created_at', { ascending:false }));
+    rows = await q(sb.from('journals').select('*, journal_lines(akun,debit,kredit,memo)').gte('tanggal', d1).lte('tanggal', d2).order('tanggal', { ascending:false }).order('created_at', { ascending:false }));
     $('#j-list').innerHTML = rows.length ? `<table><thead><tr><th>Tanggal</th><th>No / Keterangan</th><th>Akun</th><th class="n">Debit</th><th class="n">Kredit</th></tr></thead><tbody>
       ${rows.map(j => j.journal_lines.map((l, i) => `<tr>${i === 0 ? `<td rowspan="${j.journal_lines.length}">${fmtDate(j.tanggal)}</td>
         <td rowspan="${j.journal_lines.length}"><b>${esc(j.no)}</b> <span class="note">${esc(j.sumber)}</span>${j.dibatalkan ? ' ' + tag('batal') : ''}<br>${esc(j.keterangan || '')}
